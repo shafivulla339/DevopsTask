@@ -1,0 +1,178 @@
+version: 0.0
+Resources:
+  ## ECS CLUSTER
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+
+  EcsServiceScalingTargetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+      Policies:
+        - PolicyName: Scaling
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:*
+                  - ecs:*
+                  - cloudwatch:*
+                Resource: '*'
+
+
+  ##  SERVICE
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AWS::StackName
+      RetentionInDays: 7
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AWS::StackName
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CodeBuildPushPull
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+
+  EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EcrRepository
+    Properties:
+      Family: !Ref AWS::StackName
+      ContainerDefinitions:
+        - Name: !Ref AWS::StackName
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.us-east-1.amazonaws.com/${AWS::StackName}:latest
+          Cpu: 256
+          MemoryReservation: 512
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AWS::StackName
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref AWS::StackName
+          Environment:
+          - Name: NODE_ENV
+            Value: production
+          # any additional env vars
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - EcrRepository
+    Properties:
+      TaskDefinition: !Ref EcsTaskDefinition
+      DesiredCount: 0 # only when creating stack
+      LaunchType: FARGATE # or EC2 if using instances
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+      PlacementStrategies:
+        - Type: spread
+          Field: instanceId
+      Cluster: !Ref EcsCluster
+
+  EcsServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: 0
+      MaxCapacity: 0
+      ResourceId:
+        !Sub
+          - service/${EcsCluster}/${EcsService}
+          - EcsCluster: !Ref EcsCluster
+            EcsService: !GetAtt EcsService.Name
+      RoleARN: !GetAtt EcsServiceScalingTargetRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  EcsServiceScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: EcsServiceScaleOutPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref EcsServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: PercentChangeInCapacity
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            MetricIntervalUpperBound: 10
+            ScalingAdjustment: 10
+          - MetricIntervalLowerBound: 10
+            ScalingAdjustment: 30
+
+  EcsServiceScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: EcsServiceScaleInPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref EcsServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: PercentChangeInCapacity
+        StepAdjustments:
+          - MetricIntervalLowerBound: -10
+            MetricIntervalUpperBound: 0
+            ScalingAdjustment: -10
+          - MetricIntervalUpperBound: -10
+            ScalingAdjustment: -30
+
+  EcsServiceHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 2
+      Statistic: Average
+      Threshold: 70
+      AlarmDescription: Alarm if ECS Service CPU high.
+      Period: 60
+      AlarmActions:
+        - !Ref EcsServiceScaleOutPolicy
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EcsCluster
+        - Name: ServiceName
+          Value: !GetAtt EcsService.Name
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      MetricName: CPUUtilization
+
+  EcsServiceLowCPUAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        EvaluationPeriods: 2
+        Statistic: Average
+        Threshold: 40
+        AlarmDescription: Alarm if ECS Service CPU low.
+        Period: 60
+        AlarmActions:
+          - !Ref EcsServiceScaleInPolicy
+        Namespace: AWS/ECS
+        Dimensions:
+          - Name: ClusterName
+            Value: !Ref EcsCluster
+          - Name: ServiceName
+            Value: !GetAtt EcsService.Name
+        ComparisonOperator: LessThanOrEqualToThreshold
+        MetricName: CPUUtilization
